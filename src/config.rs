@@ -1,8 +1,8 @@
 //! Session / application configuration.
 //!
 //! Persists a simple JSON file under the platform's standard config dir
-//! (e.g. `%APPDATA%/meatshell/sessions.json` on Windows,
-//!  `~/.config/meatshell/sessions.json` on Linux/macOS).
+//! (e.g. `%APPDATA%/ashell/sessions.json` on Windows,
+//!  `~/.config/ashell/sessions.json` on Linux/macOS).
 //!
 //! ## Password encryption
 //!
@@ -306,7 +306,7 @@ pub struct ConfigFile {
 
 /// Portable export file (issue #46): sessions with everything in plaintext
 /// **except** the password, which is encrypted with a fixed key baked into the
-/// binary so the file opens on *any* machine running meatshell.
+/// binary so the file opens on *any* machine running ashell.
 ///
 /// Security note: a built-in key in open-source code is **obfuscation, not real
 /// security** — anyone with the source can derive it. It only stops a casual
@@ -314,7 +314,7 @@ pub struct ConfigFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExportFile {
     /// Format marker / version so the schema can evolve later.
-    meatshell_export: u32,
+    ashell_export: u32,
     sessions: Vec<Session>,
 }
 
@@ -335,7 +335,7 @@ impl ConfigStore {
 
     /// Fixed 32-byte key for portable exports. Baked into the binary so an
     /// exported file decrypts on any machine. Obfuscation only — see `ExportFile`.
-    const EXPORT_KEY: [u8; 32] = *b"meatshell.export.portable.key.01";
+    const EXPORT_KEY: [u8; 32] = *b"ashell.export.portable.key.01.01";
 
     // ── Encryption helpers ────────────────────────────────────────────────
 
@@ -457,7 +457,7 @@ impl ConfigStore {
     }
 
     fn config_path() -> Result<PathBuf> {
-        let dirs = ProjectDirs::from("dev", "meatshell", "meatshell")
+        let dirs = ProjectDirs::from("dev", "ashell", "ashell")
             .context("could not determine user config directory")?;
         Ok(dirs.config_dir().join("sessions.json"))
     }
@@ -746,7 +746,7 @@ impl ConfigStore {
     /// file is human-readable and editable. Returns the number of sessions.
     pub fn export_to(&self, path: &Path) -> Result<usize> {
         let mut out = ExportFile {
-            meatshell_export: 1,
+            ashell_export: 1,
             sessions: self.cache.sessions.clone(),
         };
         for s in &mut out.sessions {
@@ -770,7 +770,7 @@ impl ConfigStore {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         let file: ExportFile = serde_json::from_str(&raw)
-            .context("not a valid meatshell export file")?;
+            .context("not a valid ashell export file")?;
 
         let mut added = 0usize;
         let mut skipped = 0usize;
@@ -849,4 +849,28 @@ mod tests {
         let _ = std::fs::remove_file(&a.path);
         let _ = std::fs::remove_file(&b.path);
     }
+}
+
+// ── Global configuration instance ────────────────────────────────────────────
+
+use std::sync::RwLock;
+use once_cell::sync::OnceCell;
+
+/// Global configuration store for runtime settings like download preferences.
+/// Uses RwLock to allow concurrent read access from multiple threads.
+static GLOBAL_CONFIG: OnceCell<RwLock<ConfigStore>> = OnceCell::new();
+
+/// Initialize the global configuration store.
+/// Must be called once at application startup.
+pub fn init_global_config() -> Result<()> {
+    let store = ConfigStore::load().context("failed to load config")?;
+    GLOBAL_CONFIG.set(RwLock::new(store)).map_err(|_| {
+        anyhow::anyhow!("global config already initialized")
+    })?;
+    Ok(())
+}
+
+/// Get the global configuration store.
+pub fn global_config() -> &'static RwLock<ConfigStore> {
+    GLOBAL_CONFIG.get().expect("global config not initialized")
 }

@@ -35,6 +35,8 @@ fn main() -> anyhow::Result<()> {
     // are handled instead by the C0-marker + 3-layer Backspace filters in
     // `app::on_send_key`, so we no longer need (and must not use) ImmDisableIME.
 
+    // Initialize global configuration for runtime settings
+    config::init_global_config()?;
     app::run()
 }
 

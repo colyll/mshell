@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
+use slint::Weak;
+
 /// Per-terminal state: vt100 parser drives all rendering for both normal
 /// (bash) and alt-screen (vim/nano/htop) modes.
 ///
@@ -150,6 +152,8 @@ fn set_window_icon(window: &AppWindow) {
 
 pub fn run() -> Result<()> {
     // --- Runtime + store -------------------------------------------------
+    // Global config is already initialized in main.rs via config::init_global_config()
+    // The local store is still needed for UI initialization and saving changes
     let runtime = Arc::new(
         Runtime::new().context("failed to start tokio runtime")?,
     );
@@ -180,9 +184,9 @@ pub fn run() -> Result<()> {
     // --- Build window + models ------------------------------------------
     // Set the Wayland app_id / X11 WM_CLASS *before* the window is created so
     // the Linux desktop shell can match the running window to the installed
-    // `meatshell.desktop` entry and show our icon in the dock/taskbar.  (On
+    // `ashell.desktop` entry and show our icon in the dock/taskbar.  (On
     // Windows the icon comes from the embedded .ico, so this is a no-op there.)
-    let _ = slint::set_xdg_app_id("meatshell");
+    let _ = slint::set_xdg_app_id("ashell");
     let window = AppWindow::new().context("failed to build Slint window")?;
 
     // Show the crate version (from Cargo.toml at compile time) in the sidebar,
@@ -261,15 +265,41 @@ pub fn run() -> Result<()> {
         });
     }
 
-    // Interface setting: always ask where to save on download (#87). Read live
-    // by the download handler from the window property, so just set + persist.
+    // Interface setting: always ask where to save on download (#87).
     window.set_download_always_ask(store.borrow().download_always_ask());
     {
         let store = store.clone();
         window.on_set_download_always_ask(move |ask| {
+            // Update global config and local store
+            let mut cfg = crate::config::global_config().write().unwrap();
+            cfg.set_download_always_ask(ask);
+            drop(cfg);
             let mut s = store.borrow_mut();
             s.set_download_always_ask(ask);
             let _ = s.save();
+        });
+    }
+
+    // Preset download directory.
+    window.set_download_dir(store.borrow().download_dir().to_string().into());
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_pick_download_dir(move || {
+            if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                let selected_dir = folder.to_string_lossy().to_string();
+                // Update global config and local store
+                {
+                    let mut cfg = crate::config::global_config().write().unwrap();
+                    cfg.set_download_dir(selected_dir.clone());
+                }
+                let mut s = store.borrow_mut();
+                s.set_download_dir(selected_dir.clone());
+                let _ = s.save();
+                if let Some(w) = weak.upgrade() {
+                    w.set_download_dir(selected_dir.into());
+                }
+            }
         });
     }
 
@@ -485,37 +515,7 @@ pub fn run() -> Result<()> {
         });
     }
 
-    // Settings: preset download directory (load + pick + open).
-    // Default to the user's Downloads folder so files land somewhere sensible
-    // without a prompt; only fall back to "ask every time" if we can't locate it
-    // (#85). Persist it on first run so the setting reflects the real path.
-    if store.borrow().download_dir().is_empty() {
-        if let Some(dl) = directories::UserDirs::new()
-            .and_then(|u| u.download_dir().map(|p| p.to_string_lossy().to_string()))
-        {
-            let mut s = store.borrow_mut();
-            s.set_download_dir(dl);
-            let _ = s.save();
-        }
-    }
-    window.set_download_dir(store.borrow().download_dir().to_string().into());
-    {
-        let weak = window.as_weak();
-        let store = store.clone();
-        window.on_pick_download_dir(move || {
-            if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                let dir = folder.to_string_lossy().to_string();
-                {
-                    let mut s = store.borrow_mut();
-                    s.set_download_dir(dir.clone());
-                    let _ = s.save();
-                }
-                if let Some(w) = weak.upgrade() {
-                    w.set_download_dir(dir.into());
-                }
-            }
-        });
-    }
+
     {
         let weak = window.as_weak();
         window.on_open_download_dir(move || {
@@ -538,7 +538,7 @@ pub fn run() -> Result<()> {
     // --- In-app update check (#48) -----------------------------------------
     // "Download" on the banner opens the latest-release page in the browser.
     window.on_open_update_url(move || {
-        let url = "https://github.com/jeff141/meatshell/releases/latest";
+        let url = "https://github.com/jeff141/ashell/releases/latest";
         #[cfg(windows)]
         let _ = std::process::Command::new("explorer").arg(url).spawn();
         #[cfg(target_os = "macos")]
@@ -553,9 +553,9 @@ pub fn run() -> Result<()> {
         let weak = window.as_weak();
         std::thread::spawn(move || {
             let body = match ureq::get(
-                "https://api.github.com/repos/jeff141/meatshell/releases/latest",
+                "https://api.github.com/repos/jeff141/ashell/releases/latest",
             )
-            .set("User-Agent", "meatshell-update-check")
+            .set("User-Agent", "ashell-update-check")
             .timeout(std::time::Duration::from_secs(8))
             .call()
             {
@@ -771,19 +771,74 @@ fn center_window(win: &AppWindow) {
 #[cfg(not(windows))]
 fn center_window(_win: &AppWindow) {}
 
-/// The active terminal tab's current SFTP directory ("" if unknown).
-fn active_sftp_path(win: &AppWindow, tab_id: &str) -> String {
+/// The active terminal tab's current SFTP remote directory ("" if unknown).
+fn active_sftp_remote_path(win: &AppWindow, tab_id: &str) -> String {
     let model = win.get_terminals();
     if let Some(m) = model.as_any().downcast_ref::<VecModel<TerminalState>>() {
         for i in 0..m.row_count() {
             if let Some(row) = m.row_data(i) {
                 if row.id.as_str() == tab_id {
-                    return row.sftp_path.to_string();
+                    return row.sftp_remote_path.to_string();
                 }
             }
         }
     }
     String::new()
+}
+
+/// Load local directory entries and update the UI.
+fn load_local_directory(weak: &Weak<AppWindow>, tab_id: &str, path: &str) {
+    if let Some(win) = weak.upgrade() {
+        let model = win.get_terminals();
+        if let Some(m) = model.as_any().downcast_ref::<VecModel<TerminalState>>() {
+            for i in 0..m.row_count() {
+                if let Some(mut row) = m.row_data(i) {
+                    if row.id.as_str() == tab_id {
+                        // Read local directory
+                        let entries: Vec<SftpEntry> = match std::fs::read_dir(path) {
+                            Ok(read_dir) => {
+                                read_dir
+                                    .filter_map(|res| res.ok())
+                                    .filter_map(|entry| {
+                                        let path = entry.path();
+                                        let name = entry.file_name().to_string_lossy().to_string();
+                                        let full_path = path.to_string_lossy().to_string();
+                                        let metadata = entry.metadata().ok()?;
+                                        let is_dir = metadata.is_dir();
+                                        let size = if is_dir {
+                                            "".into()
+                                        } else {
+                                            format_size(metadata.len()).into()
+                                        };
+                                        let modified = metadata.modified().ok()
+                                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                        .map(|d| format_mtime(d.as_secs() as u32))
+                                        .unwrap_or_default().into();
+                                        let mode = if is_dir { 0o755 } else { 0o644 };
+                                        Some(SftpEntry {
+                                            name: name.into(),
+                                            full_path: full_path.into(),
+                                            is_dir,
+                                            size,
+                                            modified,
+                                            mode: mode as i32,
+                                        })
+                                    })
+                                    .collect()
+                            }
+                            Err(_) => Vec::new(),
+                        };
+                        let entries_model = ModelRc::from(std::rc::Rc::new(VecModel::from(entries.clone())));
+                        row.sftp_local_path = path.to_string().into();
+                        row.sftp_local_entries = entries_model;
+                        row.sftp_local_loading = false;
+                        m.set_row_data(i, row);
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Current mouse cursor position in physical screen pixels (Windows).
@@ -845,7 +900,7 @@ fn handle_file_drop(win: &AppWindow, sftp_handles: &SftpHandles, path: String) {
         return; // dropped outside the file list — ignore
     }
 
-    let dir = active_sftp_path(win, &active);
+    let dir = active_sftp_remote_path(win, &active);
     if dir.is_empty() {
         return;
     }
@@ -1085,7 +1140,7 @@ fn wire_session_callbacks(
         let store = store.clone();
         window.on_export_sessions(move || {
             if let Some(path) = rfd::FileDialog::new()
-                .set_file_name("meatshell-connections.json")
+                .set_file_name("ashell-connections.json")
                 .add_filter("JSON", &["json"])
                 .save_file()
             {
@@ -1552,19 +1607,27 @@ fn wire_session_callbacks(
                 is_alt_screen: false,
                 find_matches: ModelRc::from(std::rc::Rc::new(VecModel::<TermMatch>::default())),
                 selection: ModelRc::from(std::rc::Rc::new(VecModel::<TermMatch>::default())),
-                sftp_path: "/".into(),
-                sftp_entries: ModelRc::from(
+                // Local panel
+                sftp_local_path: std::env::home_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "/".to_string())
+                    .into(),
+                sftp_local_entries: ModelRc::from(
                     std::rc::Rc::new(VecModel::<SftpEntry>::default()),
                 ),
-                sftp_status: if has_sftp {
+                sftp_local_status: t("本地文件", "Local files").into(),
+                sftp_local_loading: false,
+                // Remote panel
+                sftp_remote_path: "/".into(),
+                sftp_remote_entries: ModelRc::from(
+                    std::rc::Rc::new(VecModel::<SftpEntry>::default()),
+                ),
+                sftp_remote_status: if has_sftp {
                     t("SFTP 连接中...", "SFTP connecting...").into()
                 } else {
                     t("此会话类型不支持 SFTP", "SFTP not available for this session").into()
                 },
-                sftp_loading: has_sftp,
-                sftp_tree_nodes: ModelRc::from(
-                    std::rc::Rc::new(VecModel::<SftpTreeNode>::default()),
-                ),
+                sftp_remote_loading: has_sftp,
             });
             // Create vt100 parser for this tab (default 24×80; resized on first
             // terminal-resize callback). 5000-line scrollback is stored for
@@ -1792,7 +1855,7 @@ fn terminal_sftp_paths(w: &AppWindow) -> HashMap<String, String> {
     if let Some(terminals) = model.as_any().downcast_ref::<VecModel<TerminalState>>() {
         for i in 0..terminals.row_count() {
             if let Some(row) = terminals.row_data(i) {
-                out.insert(row.id.to_string(), row.sftp_path.to_string());
+                out.insert(row.id.to_string(), row.sftp_local_path.to_string());
             }
         }
     }
@@ -2257,8 +2320,8 @@ fn apply_session_event_to_window(
             // Just update the displayed path; the pump thread already sent
             // SftpCommand::ListDir so a SftpEntries event is inbound.
             update_terminal(&|t| {
-                t.sftp_path = path.clone().into();
-                t.sftp_loading = true;
+                t.sftp_remote_path = path.clone().into();
+                t.sftp_remote_loading = true;
             });
         }
         SessionEvent::SftpEntries { path, entries } => {
@@ -2281,13 +2344,13 @@ fn apply_session_event_to_window(
                 std::rc::Rc::new(VecModel::from(slint_entries)),
             );
             update_terminal(&|t| {
-                t.sftp_path = path.clone().into();
-                t.sftp_entries = model.clone();
-                t.sftp_loading = false;
+                t.sftp_remote_path = path.clone().into();
+                t.sftp_remote_entries = model.clone();
+                t.sftp_remote_loading = false;
             });
         }
         SessionEvent::SftpStatus(msg) => {
-            update_terminal(&|t| t.sftp_status = msg.clone().into());
+            update_terminal(&|t| t.sftp_remote_status = msg.clone().into());
         }
         SessionEvent::SftpFileText {
             path,
@@ -2313,7 +2376,7 @@ fn apply_session_event_to_window(
                     win,
                     tab_id,
                     SessionEvent::Output(format!(
-                        "\r\n[meatshell] {} {}: {}\r\n",
+                        "\r\n[ashell] {} {}: {}\r\n",
                         crate::i18n::t("无法打开", "Cannot open"),
                         name,
                         error
@@ -2323,22 +2386,8 @@ fn apply_session_event_to_window(
                     local,
                     local_net_hist,
                 );
-                update_terminal(&|t| t.sftp_status = error.clone().into());
+                update_terminal(&|t| t.sftp_remote_status = error.clone().into());
             }
-        }
-        SessionEvent::SftpTreeUpdate(nodes) => {
-            let slint_nodes: Vec<SftpTreeNode> = nodes
-                .iter()
-                .map(|n| SftpTreeNode {
-                    path: n.path.clone().into(),
-                    name: n.name.clone().into(),
-                    depth: n.depth as i32,
-                    expanded: n.expanded,
-                    has_children: n.has_children,
-                })
-                .collect();
-            let model = ModelRc::from(std::rc::Rc::new(VecModel::from(slint_nodes)));
-            update_terminal(&|t| t.sftp_tree_nodes = model.clone());
         }
         SessionEvent::SftpTransfer {
             id,
@@ -2500,12 +2549,89 @@ fn wire_sftp_callbacks(
     sftp_handles: SftpHandles,
     sftp_last_cwd: SftpLastCwd,
 ) {
+    // --- Local panel callbacks ---
+
+    // Navigate to a local path (or ".." to go up one level).
+    {
+        let weak = window.as_weak();
+        window.on_sftp_local_navigate(move |tab_id: SharedString, path: SharedString| {
+            let tab_id = tab_id.to_string();
+            let path = path.trim();
+            let resolved = if path == ".." {
+                let current = weak.upgrade().and_then(|w| {
+                    let terminals_rc = w.get_terminals();
+                    let terminals = terminals_rc
+                        .as_any()
+                        .downcast_ref::<VecModel<TerminalState>>()?;
+                    for i in 0..terminals.row_count() {
+                        if let Some(row) = terminals.row_data(i) {
+                            if row.id.as_str() == tab_id {
+                                return Some(row.sftp_local_path.to_string());
+                            }
+                        }
+                    }
+                    None
+                });
+                parent_path(&current.unwrap_or_else(|| "/".to_string()))
+            } else {
+                path.to_string()
+            };
+            // Load local directory entries
+            load_local_directory(&weak, &tab_id, &resolved);
+        });
+    }
+
+    // Upload a local file/directory to remote path
+    {
+        let weak = window.as_weak();
+        let sftp_handles = sftp_handles.clone();
+        window.on_sftp_local_upload(move |tab_id: SharedString, local_path: SharedString, _is_dir: bool| {
+            let tab_id = tab_id.to_string();
+            let local_path = local_path.to_string();
+            let sftp_handles = sftp_handles.clone();
+            // Get remote path from terminal state
+            let remote_dir = weak.upgrade().and_then(|w| {
+                let terminals_rc = w.get_terminals();
+                let terminals = terminals_rc
+                    .as_any()
+                    .downcast_ref::<VecModel<TerminalState>>()?;
+                for i in 0..terminals.row_count() {
+                    if let Some(row) = terminals.row_data(i) {
+                        if row.id.as_str() == tab_id {
+                            return Some(row.sftp_remote_path.to_string());
+                        }
+                    }
+                }
+                None
+            }).unwrap_or_else(|| "/".to_string());
+            std::thread::spawn(move || {
+                if let Ok(handles) = sftp_handles.lock() {
+                    if let Some(h) = handles.get(&tab_id) {
+                        h.upload(local_path, remote_dir);
+                    }
+                }
+            });
+        });
+    }
+
+    // Refresh local directory listing
+    {
+        let weak = window.as_weak();
+        window.on_sftp_local_refresh(move |tab_id: SharedString, path: SharedString| {
+            let tab_id = tab_id.to_string();
+            let path = path.to_string();
+            load_local_directory(&weak, &tab_id, &path);
+        });
+    }
+
+    // --- Remote panel callbacks ---
+
     // Navigate to a remote path (or ".." to go up one level).
     {
         let sftp_handles = sftp_handles.clone();
         let sftp_last_cwd = sftp_last_cwd.clone();
         let weak = window.as_weak();
-        window.on_sftp_navigate(move |tab_id: SharedString, path: SharedString| {
+        window.on_sftp_remote_navigate(move |tab_id: SharedString, path: SharedString| {
             let tab_id = tab_id.to_string();
             // A pasted path may carry trailing whitespace / newline (#54).
             let path = path.trim();
@@ -2518,7 +2644,7 @@ fn wire_sftp_callbacks(
                     for i in 0..terminals.row_count() {
                         if let Some(row) = terminals.row_data(i) {
                             if row.id.as_str() == tab_id {
-                                return Some(row.sftp_path.to_string());
+                                return Some(row.sftp_remote_path.to_string());
                             }
                         }
                     }
@@ -2540,33 +2666,38 @@ fn wire_sftp_callbacks(
         });
     }
 
-    // Download a remote file.  If a download folder is preset in settings, save
-    // straight there; otherwise fall back to a native folder picker.
+    // Download a remote file to local path
     {
         let sftp_handles = sftp_handles.clone();
         let weak = window.as_weak();
-        window.on_sftp_download(move |tab_id: SharedString, remote_path: SharedString| {
+        window.on_sftp_remote_download(move |tab_id: SharedString, remote_path: SharedString| {
             let tab_id = tab_id.to_string();
             let remote_path = remote_path.to_string();
-            // "Always ask" (#87) forces the folder picker, ignoring the preset.
-            let (preset, always_ask) = weak
-                .upgrade()
-                .map(|w| {
-                    (
-                        w.get_download_dir().to_string(),
-                        w.get_download_always_ask(),
-                    )
+            // Get local path from terminal state
+            let local_dir = {
+                weak.upgrade().and_then(|w| {
+                    let terminals_rc = w.get_terminals();
+                    let terminals = terminals_rc
+                        .as_any()
+                        .downcast_ref::<VecModel<TerminalState>>()?;
+                    for i in 0..terminals.row_count() {
+                        if let Some(row) = terminals.row_data(i) {
+                            if row.id.as_str() == tab_id {
+                                return Some(row.sftp_local_path.to_string());
+                            }
+                        }
+                    }
+                    None
+                }).unwrap_or_else(|| {
+                    directories::UserDirs::new()
+                        .and_then(|u| u.download_dir().map(|p| p.to_string_lossy().to_string()))
+                        .unwrap_or_default()
                 })
-                .unwrap_or_default();
-            if !always_ask && !preset.is_empty() {
+            };
+            if !local_dir.is_empty() {
                 if let Ok(handles) = sftp_handles.lock() {
                     if let Some(h) = handles.get(&tab_id) {
-                        h.download(remote_path, preset);
-                        // Pop the transfers panel so progress is visible (user
-                        // request: any download opens the download popup).
-                        if let Some(w) = weak.upgrade() {
-                            w.set_download_open(true);
-                        }
+                        h.download(remote_path, local_dir);
                     }
                 }
                 return;
@@ -2587,83 +2718,10 @@ fn wire_sftp_callbacks(
         });
     }
 
-    // Upload a local file into the current remote directory.
+    // Refresh remote directory listing
     {
         let sftp_handles = sftp_handles.clone();
-        let weak = window.as_weak();
-        window.on_sftp_upload_clicked(
-            move |tab_id: SharedString, remote_dir: SharedString, folder: bool| {
-                let tab_id = tab_id.to_string();
-                let remote_dir = remote_dir.to_string();
-                let sftp_handles = sftp_handles.clone();
-                // Session-sync upload (#sync): when both the sync toggle and the
-                // "sync upload" setting are on, mirror the upload to every other
-                // online session — each into *that session's own* current SFTP
-                // directory (paths differ between sessions, e.g. /home/jeff vs
-                // /home/root, so the active session's path can't be reused).
-                // Gather targets on the UI thread (Slint models aren't Send).
-                let sync_targets: Vec<(String, String)> = weak
-                    .upgrade()
-                    .filter(|w| w.get_sync_input() && w.get_sync_upload_enabled())
-                    .map(|w| {
-                        let paths = terminal_sftp_paths(&w);
-                        let handles = sftp_handles.lock().ok();
-                        handles
-                            .iter()
-                            .flat_map(|h| h.keys())
-                            .filter(|id| *id != &tab_id)
-                            .filter_map(|id| paths.get(id).map(|dir| (id.clone(), dir.clone())))
-                            .filter(|(_, dir)| !dir.is_empty())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                std::thread::spawn(move || {
-                    // The remote SFTP upload handles a file or a whole directory;
-                    // only the local picker differs (#85). Folder uploads one dir;
-                    // file mode allows selecting several at once.
-                    let locals: Vec<String> = if folder {
-                        rfd::FileDialog::new()
-                            .pick_folder()
-                            .map(|p| vec![p.to_string_lossy().to_string()])
-                            .unwrap_or_default()
-                    } else {
-                        rfd::FileDialog::new()
-                            .pick_files()
-                            .map(|v| {
-                                v.into_iter()
-                                    .map(|p| p.to_string_lossy().to_string())
-                                    .collect()
-                            })
-                            .unwrap_or_default()
-                    };
-                    if locals.is_empty() {
-                        return;
-                    }
-                    if let Ok(handles) = sftp_handles.lock() {
-                        if let Some(h) = handles.get(&tab_id) {
-                            for local in &locals {
-                                h.upload(local.clone(), remote_dir.clone());
-                            }
-                        }
-                        // Mirror to the other online sessions, each into its own
-                        // current SFTP directory.
-                        for (id, dir) in &sync_targets {
-                            if let Some(h) = handles.get(id) {
-                                for local in &locals {
-                                    h.upload(local.clone(), dir.clone());
-                                }
-                            }
-                        }
-                    }
-                });
-            },
-        );
-    }
-
-    // Refresh the current directory listing.
-    {
-        let sftp_handles = sftp_handles.clone();
-        window.on_sftp_refresh(move |tab_id: SharedString, path: SharedString| {
+        window.on_sftp_remote_refresh(move |tab_id: SharedString, path: SharedString| {
             let tab_id = tab_id.to_string();
             let path = path.to_string();
             if let Ok(handles) = sftp_handles.lock() {
@@ -2674,20 +2732,20 @@ fn wire_sftp_callbacks(
         });
     }
 
-    // Toggle tree node expand/collapse and navigate to that directory.
+    // Sync terminal cwd to remote panel
     {
         let sftp_handles = sftp_handles.clone();
         let sftp_last_cwd = sftp_last_cwd.clone();
-        window.on_sftp_tree_expand(move |tab_id: SharedString, path: SharedString| {
+        window.on_sftp_remote_sync_path(move |tab_id: SharedString| {
             let tab_id = tab_id.to_string();
-            let path = path.to_string();
-            // Forget the followed cwd (see on_sftp_navigate): tree navigation
-            // must never permanently disable cd-follow.
-            sftp_last_cwd.lock().unwrap().remove(&tab_id);
+            // Get the last known cwd from the sftp_last_cwd map
+            let cwd = sftp_last_cwd.lock().ok()
+                .and_then(|m| m.get(&tab_id).cloned())
+                .unwrap_or_else(|| "/".to_string());
+
             if let Ok(handles) = sftp_handles.lock() {
                 if let Some(h) = handles.get(&tab_id) {
-                    h.toggle_tree_node(path.clone());
-                    h.list_dir(path);
+                    h.sync_cwd(cwd);
                 }
             }
         });
@@ -2698,7 +2756,7 @@ fn wire_sftp_callbacks(
     // time this fires the user has already confirmed.
     {
         let sftp_handles = sftp_handles.clone();
-        window.on_sftp_delete(move |tab_id: SharedString, path: SharedString| {
+        window.on_sftp_remote_delete(move |tab_id: SharedString, path: SharedString| {
             if let Ok(handles) = sftp_handles.lock() {
                 if let Some(h) = handles.get(tab_id.as_str()) {
                     h.delete(path.to_string());
@@ -2711,7 +2769,7 @@ fn wire_sftp_callbacks(
     // text into the built-in editor instead of an external app (#70).
     {
         let sftp_handles = sftp_handles.clone();
-        window.on_sftp_view(move |tab_id: SharedString, path: SharedString| {
+        window.on_sftp_remote_view(move |tab_id: SharedString, path: SharedString| {
             if let Ok(handles) = sftp_handles.lock() {
                 if let Some(h) = handles.get(tab_id.as_str()) {
                     h.read_text(path.to_string(), false);
@@ -2721,7 +2779,7 @@ fn wire_sftp_callbacks(
     }
     {
         let sftp_handles = sftp_handles.clone();
-        window.on_sftp_edit(move |tab_id: SharedString, path: SharedString| {
+        window.on_sftp_remote_edit(move |tab_id: SharedString, path: SharedString| {
             if let Ok(handles) = sftp_handles.lock() {
                 if let Some(h) = handles.get(tab_id.as_str()) {
                     h.read_text(path.to_string(), true);
@@ -2734,7 +2792,7 @@ fn wire_sftp_callbacks(
     // re-uploads on every change.
     {
         let sftp_handles = sftp_handles.clone();
-        window.on_sftp_open_external(move |tab_id: SharedString, path: SharedString| {
+        window.on_sftp_remote_open_external(move |tab_id: SharedString, path: SharedString| {
             if let Ok(handles) = sftp_handles.lock() {
                 if let Some(h) = handles.get(tab_id.as_str()) {
                     h.open_temp(path.to_string(), false);
@@ -2744,7 +2802,7 @@ fn wire_sftp_callbacks(
     }
     {
         let sftp_handles = sftp_handles.clone();
-        window.on_sftp_edit_external(move |tab_id: SharedString, path: SharedString| {
+        window.on_sftp_remote_edit_external(move |tab_id: SharedString, path: SharedString| {
             if let Ok(handles) = sftp_handles.lock() {
                 if let Some(h) = handles.get(tab_id.as_str()) {
                     h.open_temp(path.to_string(), true);
@@ -4728,20 +4786,38 @@ fn idx_to_rgb_bg(i: u8, is_dark: bool) -> (u8, u8, u8) {
 /// Return the parent directory of `path`.
 /// "/a/b/c" → "/a/b", "/a" → "/", "/" → "/"
 fn parent_path(path: &str) -> String {
-    let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() {
-        return "/".to_string();
+    // Determine separator based on existing separator in the path
+    let sep = if path.contains('/') { '/' } else { '\\' };
+
+    let trimmed = path.trim_end_matches(sep);
+    if trimmed.ends_with(':') {
+        return format!("{}{}", trimmed, sep);
     }
-    match trimmed.rfind('/') {
-        Some(0) => "/".to_string(),
-        Some(i) => trimmed[..i].to_string(),
-        None => "/".to_string(),
+    match trimmed.rfind(sep) {
+        Some(0) => sep.to_string(),
+        Some(i) => format!("{}{}", trimmed[..i].to_string(), sep),
+        None => sep.to_string(),
     }
 }
 
 #[cfg(test)]
 mod key_tests {
     use super::*;
+
+    #[test]
+    fn parent_path_handles_root() {
+        // Unix root
+        assert_eq!(parent_path("/"), "/");
+        // Windows root
+        assert_eq!(parent_path("C:/"), "C:/");
+        assert_eq!(parent_path("C:\\"), "C:\\");
+    }
+
+    #[test]
+    fn parent_path_handles_subdirs() {
+        assert_eq!(parent_path("/home"), "/");
+        assert_eq!(parent_path("/home/user"), "/home");
+    }
 
     #[test]
     fn bare_alt_is_not_forwarded() {

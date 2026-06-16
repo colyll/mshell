@@ -40,16 +40,6 @@ pub struct RemoteEntry {
     pub mode: u32,
 }
 
-/// One node in the remote directory tree panel.
-#[derive(Debug, Clone)]
-pub struct RemoteTreeNode {
-    pub path: String,
-    pub name: String,
-    pub depth: u32,
-    pub expanded: bool,
-    pub has_children: bool,
-}
-
 /// Format a byte count as a human-readable string.
 pub fn format_size(bytes: u64) -> String {
     if bytes < 1_024 {
@@ -88,6 +78,26 @@ const ZMODEM_CANCEL: [u8; 16] = [
 fn contains_zmodem_init(data: &[u8]) -> bool {
     data.windows(2)
         .any(|w| w[0] == 0x18 && (w[1] == b'B' || w[1] == b'C'))
+}
+
+/// Detect if this is a ZFILE header in a ZMODEM transfer.
+/// 
+/// ZMODEM protocol:
+/// - sz (server sends file): sends ZFILE header (ZDLE + ZHEX/ZBIN32 + ZFILE=0x04)
+/// - rz (client sends file): server sends ZRQINIT (ZDLE + ZHEX/ZBIN32 + ZRQINIT=0x00)
+/// 
+/// This function returns true for sz (receive) and false for rz (send).
+/// 
+/// ZFILE frame format: ZDLE + frame-type (ZHEX='B' or ZBIN32='C') + ZFILE-type (0x04)
+fn contains_zmodem_file_header(data: &[u8]) -> bool {
+    // ZMODEM HEX frame: ** (padding) + ZDLE + ZHEX/ZBIN32 + type + position(4) + optional data
+    // For ZFILE: type byte = 0x04
+    // Pattern: 0x18 0x42 0x04 (ZDLE + ZHEX + ZFILE)
+    // or: 0x18 0x43 0x04 (ZDLE + ZBIN32 + ZFILE)
+    data.windows(3).any(|w| {
+        (w[0] == 0x18 && w[1] == b'B' && w[2] == 0x04) || // ZDLE + ZHEX + ZFILE
+        (w[0] == 0x18 && w[1] == b'C' && w[2] == 0x04)    // ZDLE + ZBIN32 + ZFILE
+    })
 }
 
 /// Extract the remote path from an OSC 7 sequence embedded in `text`.
@@ -226,8 +236,6 @@ pub enum SessionEvent {
     },
     /// Free-form SFTP status message (progress, errors, etc.).
     SftpStatus(String),
-    /// Directory tree structure changed (full rebuild pushed on every toggle).
-    SftpTreeUpdate(Vec<RemoteTreeNode>),
     /// File-transfer progress / completion (download or upload).
     SftpTransfer {
         id: String,
@@ -535,13 +543,13 @@ async fn run_session(
         match handle.tcpip_forward(bind.clone(), f.bind_port as u32).await {
             Ok(_) => {
                 let _ = events.send(SessionEvent::Output(format!(
-                    "\r\n[meatshell] -R {bind}:{} → {}:{}\r\n",
+                    "\r\n[ashell] -R {bind}:{} → {}:{}\r\n",
                     f.bind_port, f.host, f.host_port
                 )));
             }
             Err(e) => {
                 let _ = events.send(SessionEvent::Output(format!(
-                    "\r\n[meatshell] -R {bind}:{} 请求失败 / request failed: {e}\r\n",
+                    "\r\n[ashell] -R {bind}:{} 请求失败 / request failed: {e}\r\n",
                     f.bind_port
                 )));
             }
@@ -603,8 +611,27 @@ async fn run_session(
                         let zmodem_cooldown = zmodem_done_at
                             .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2));
                         if !zmodem_cooldown && contains_zmodem_init(&data) {
-                            let result =
-                                crate::zmodem::receive(&mut channel, &data, &events).await;
+                            // Determine if this is sz (receive) or rz (send)
+                            // sz sends ZFILE header, rz just sends ZRQINIT
+                            let is_sz = contains_zmodem_file_header(&data);
+                            
+                            let result = if is_sz {
+                                // Read config values before await to avoid holding the lock
+                                let (download_always_ask, download_dir) = {
+                                    let config = crate::config::global_config().read().unwrap();
+                                    (config.download_always_ask(), config.download_dir().to_string())
+                                };
+                                crate::zmodem::receive(
+                                    &mut channel,
+                                    &data,
+                                    &events,
+                                    download_always_ask,
+                                    &download_dir,
+                                ).await
+                            } else {
+                                crate::zmodem::send(&mut channel, &data, &events).await
+                            };
+                            
                             zmodem_done_at = Some(std::time::Instant::now());
                             match result {
                                 Ok(leftover) => {
@@ -625,7 +652,7 @@ async fn run_session(
                                     tracing::warn!("zmodem receive failed: {e:#}");
                                     let _ = channel.data(&ZMODEM_CANCEL[..]).await;
                                     let _ = events.send(SessionEvent::Output(format!(
-                                        "\r\n[meatshell] {}: {e}\r\n",
+                                        "\r\n[ashell] {}: {e}\r\n",
                                         t("ZMODEM 接收失败,已取消", "ZMODEM receive failed; cancelled")
                                     ).into()));
                                 }
@@ -1027,7 +1054,7 @@ impl Handler for ClientHandler {
                 }
                 Err(e) => {
                     let _ = events.send(SessionEvent::Output(format!(
-                        "\r\n[meatshell] -R {host}:{port} 连接失败 / connect failed: {e}\r\n"
+                        "\r\n[ashell] -R {host}:{port} 连接失败 / connect failed: {e}\r\n"
                     )));
                 }
             }

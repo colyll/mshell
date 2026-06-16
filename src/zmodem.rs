@@ -21,8 +21,9 @@ use russh::{Channel, ChannelMsg};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::UnboundedSender;
+use rfd::FileDialog;
 
 // --- Frame types -----------------------------------------------------------
 const ZRQINIT: u8 = 0;
@@ -60,6 +61,9 @@ const CANFC32: u8 = 0x20;
 /// Receive one or more files via ZMODEM. `first` is the channel chunk that
 /// triggered detection (it contains the leading ZRQINIT).
 ///
+/// `download_always_ask`: if true, always show file dialog to choose save location.
+/// `download_dir`: the preset download directory when `download_always_ask` is false.
+///
 /// Returns any bytes read past the end of the ZMODEM session (typically the
 /// shell prompt the sender's exit produces) so the caller can feed them back to
 /// the terminal — otherwise the prompt would be swallowed. On a protocol failure
@@ -68,11 +72,36 @@ pub async fn receive(
     channel: &mut Channel<Msg>,
     first: &[u8],
     events: &UnboundedSender<SessionEvent>,
+    download_always_ask: bool,
+    download_dir: &str,
 ) -> Result<Vec<u8>> {
-    let dest = download_dir();
-    tokio::fs::create_dir_all(&dest)
-        .await
-        .with_context(|| format!("create download dir {}", dest.display()))?;
+    // Determine the destination directory
+    let dest = if download_always_ask {
+        // Always ask: show file dialog
+        tokio::task::spawn_blocking(|| {
+            FileDialog::new()
+                .set_title(t("选择保存目录", "Select download directory"))
+                .pick_folder()
+        })
+        .await?  // 处理 JoinError
+        .ok_or_else(|| anyhow::anyhow!("{}", t("用户取消了保存目录选择", "User cancelled directory selection")))?
+    } else {
+        // Use preset download directory
+        let dir = if download_dir.is_empty() {
+            // Fallback to default download directory
+            directories::UserDirs::new()
+                .and_then(|u| u.download_dir().map(|p| p.to_path_buf()))
+                .unwrap_or_else(|| std::env::temp_dir().join("ashell"))
+        } else {
+            PathBuf::from(download_dir)
+        };
+        
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .with_context(|| format!("create download dir {}", dir.display()))?;
+        
+        dir
+    };
 
     tracing::debug!(
         "zmodem: receive start, first[{}]={:02x?}",
@@ -189,7 +218,7 @@ pub async fn receive(
 
     let _ = events.send(SessionEvent::Output(
         format!(
-            "\r\n[meatshell] {} {} → {}\r\n",
+            "\r\n[ashell] {} {} → {}\r\n",
             received,
             t("个文件已通过 sz 下载到", "file(s) downloaded via sz to"),
             dest.display()
@@ -214,6 +243,106 @@ struct Rx<'a> {
     ch: &'a mut Channel<Msg>,
     buf: VecDeque<u8>,
     closed: bool,
+}
+
+/// Send files via ZMODEM (for `rz` command). `first` is the channel chunk that
+/// triggered detection.
+pub async fn send(
+    channel: &mut Channel<Msg>,
+    first: &[u8],
+    events: &UnboundedSender<SessionEvent>,
+) -> Result<Vec<u8>> {
+    // 调用系统文件对话框选择要上传的文件（单个文件）
+    let path = tokio::task::spawn_blocking(|| {
+        FileDialog::new()
+            .set_title(t("选择要上传的文件", "Select file to upload"))
+            .pick_file()
+    })
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("{}", t("用户取消了文件选择", "User cancelled file selection")))?;
+
+    tracing::debug!("zmodem: send start, file: {}", path.display());
+
+    let mut rx = Rx::new(channel, first);
+    
+    // 等待远端的 ZRQINIT
+    loop {
+        let (ftype, _hdr) = rx.read_header().await?;
+        if ftype == ZRQINIT {
+            // 回复 ZRINIT
+            rx.send_hex(ZRINIT, [0, 0, 0, CANFDX | CANOVIO | CANFC32]).await?;
+            break;
+        }
+    }
+
+    // 发送文件
+    let file = tokio::fs::File::open(&path).await?;
+    let metadata = file.metadata().await?;
+    let name = path.file_name()
+        .ok_or_else(|| anyhow::anyhow!("{}", t("无法获取文件名", "Cannot get filename")))?
+        .to_string_lossy()
+        .to_string();
+    
+    tracing::debug!("zmodem: sending file {}", name);
+    
+    // 发送 ZFILE
+    let mtime = metadata.modified().ok().map(|t| {
+        t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+    }).unwrap_or(0);
+    
+    let file_size = metadata.len();
+    let id = format!("zmodem-{}", uuid::Uuid::new_v4());
+    emit(events, &id, &name, 0, file_size, 0, "");
+    
+    // 构建 ZFILE 子包数据
+    let mut zfile_data = Vec::new();
+    zfile_data.extend(name.as_bytes());
+    zfile_data.push(0); // 文件名结束
+    zfile_data.extend(format!("{}", file_size).as_bytes());
+    zfile_data.push(b' ');
+    zfile_data.extend(format!("{}", mtime).as_bytes());
+    
+    rx.send_bin(ZFILE, &zfile_data).await?;
+    
+    // 发送文件数据
+    let mut reader = tokio::io::BufReader::new(file);
+    let mut buf = [0u8; 1024];
+    let mut sent = 0u64;
+    
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        
+        rx.send_bin(ZDATA, &buf[..n]).await?;
+        sent += n as u64;
+        emit(events, &id, &name, sent, file_size, 0, "");
+    }
+    
+    // 发送 ZEOF
+    rx.send_bin(ZEOF, &[]).await?;
+    
+    // 等待 ZFIN
+    loop {
+        let (ftype, _hdr) = rx.read_header().await?;
+        if ftype == ZFIN {
+            rx.send_bin(ZFIN, &[]).await?;
+            break;
+        }
+    }
+    
+    let _ = events.send(SessionEvent::Output(
+        format!(
+            "\r\n[ashell] {} {} → {}\r\n",
+            1,
+            t("个文件已通过 rz 上传", "file uploaded via rz"),
+            t("远程服务器", "remote server")
+        )
+        .into(),
+    ));
+    
+    Ok(rx.buf.drain(..).collect())
 }
 
 impl<'a> Rx<'a> {
@@ -389,6 +518,27 @@ impl<'a> Rx<'a> {
         self.ch.data(&out[..]).await.context("zmodem send header")?;
         Ok(())
     }
+
+    /// Send a binary header with data subpacket.
+    async fn send_bin(&mut self, ftype: u8, data: &[u8]) -> Result<()> {
+        let mut out = vec![ZDLE, ZBIN32];
+        let payload = [ftype, 0, 0, 0, 0]; // 4 bytes of data for header
+        let crc = crc32_of(&payload);
+        out.extend_from_slice(&crc.to_le_bytes());
+        
+        // Add data subpacket if present
+        if !data.is_empty() {
+            let data_crc = crc32_of(data);
+            out.extend(data);
+            out.push(ZDLE);
+            out.push(ZCRCW); // end of frame, ZACK expected
+            out.extend_from_slice(&data_crc.to_le_bytes());
+        }
+        
+        tracing::debug!("zmodem tx bin type={ftype} bytes={:02x?}", &out);
+        self.ch.data(&out[..]).await.context("zmodem send bin")?;
+        Ok(())
+    }
 }
 
 /// True for bytes that make up a ZMODEM hex close frame (ZFIN) or the "OO"
@@ -401,12 +551,6 @@ fn is_close_byte(b: u8) -> bool {
         | b'0'..=b'9' | b'a'..=b'f')
 }
 
-/// Where received files go: the user's Downloads dir, else a temp fallback.
-fn download_dir() -> PathBuf {
-    directories::UserDirs::new()
-        .and_then(|u| u.download_dir().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| std::env::temp_dir().join("meatshell"))
-}
 
 /// Reduce a sender-supplied name to a safe basename inside the download dir.
 fn sanitize(name: &str) -> String {

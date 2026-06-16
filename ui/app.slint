@@ -13,13 +13,14 @@ import { Theme } from "theme.slint";
 import { Sidebar, DiskInfo } from "sidebar.slint";
 import { TabBar, TabInfo } from "tabs.slint";
 import { Welcome, SessionInfo } from "welcome.slint";
+import { IconButton } from "widgets.slint";
 import { SessionDialog, SessionDraft, PortFwd } from "session_dialog.slint";
 import { ConfirmDialog } from "confirm_dialog.slint";
 import { TerminalView, TermSpan, TermMatch, QuickCmd } from "terminal_view.slint";
-import { SftpEntry, SftpTreeNode } from "sftp_panel.slint";
+import { SftpEntry } from "sftp_panel.slint";
 import { ComboBox, SpinBox, LineEdit, Button, ScrollView, CheckBox, Palette } from "std-widgets.slint";
 
-export { SessionInfo, SessionDraft, TabInfo, SftpEntry, SftpTreeNode, QuickCmd, PortFwd }
+export { SessionInfo, SessionDraft, TabInfo, SftpEntry, QuickCmd, PortFwd }
 
 // --- TerminalState ---------------------------------------------------------
 // Per-terminal view-model exposed to Rust. A TabInfo has the metadata; the
@@ -56,64 +57,21 @@ export struct TerminalState {
     find-matches: [TermMatch], // search-highlight rectangles
     selection: [TermMatch],    // drag-selection highlight rectangles
 
-    // SFTP panel state
-    sftp-path: string,
-    sftp-entries: [SftpEntry],
-    sftp-status: string,
-    sftp-loading: bool,
-    sftp-tree-nodes: [SftpTreeNode],
-}
+    // SFTP panel state - local
+    sftp-local-path: string,
+    sftp-local-entries: [SftpEntry],
+    sftp-local-status: string,
+    sftp-local-loading: bool,
 
-// A 26×26 top-bar icon button with a hover tooltip (right-aligned so it never
-// runs off the window edge). `active` keeps the hover background lit (e.g. while
-// its popup is open).
-component IconBtn inherits Rectangle {
-    in property <string> icon;
-    in property <brush> icon-color: Theme.text-secondary;
-    in property <string> tooltip;
-    in property <bool> active;
-    callback clicked();
-    width: 26px;
-    height: 26px;
-    border-radius: Theme.radius-sm;
-    background: ta.has-hover || root.active ? Theme.bg-hover : transparent;
-    ta := TouchArea {
-        mouse-cursor: pointer;
-        clicked => { root.clicked(); }
-    }
-    Text {
-        text: root.icon;
-        font-family: "Material Icons";
-        color: root.icon-color;
-        font-size: Theme.fs-md;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-    }
-    if ta.has-hover && root.tooltip != "" : Rectangle {
-        y: parent.height + 5px;
-        x: parent.width - self.width;   // align right edge with the icon
-        width: tip-txt.preferred-width + 16px;
-        height: 22px;
-        background: Theme.bg-elevated;
-        border-radius: Theme.radius-sm;
-        border-width: 1px;
-        border-color: Theme.border-strong;
-        drop-shadow-blur: 8px;
-        drop-shadow-color: #00000070;
-        tip-txt := Text {
-            text: root.tooltip;
-            color: Theme.text-primary;
-            font-size: Theme.fs-xs;
-            horizontal-alignment: center;
-            vertical-alignment: center;
-            width: parent.width;
-            height: parent.height;
-        }
-    }
+    // SFTP panel state - remote
+    sftp-remote-path: string,
+    sftp-remote-entries: [SftpEntry],
+    sftp-remote-status: string,
+    sftp-remote-loading: bool,
 }
 
 export component AppWindow inherits Window {
-    title: "meatshell";
+    title: "ashell";
     icon: @image-url("../assets/icon.png");
     min-width: 960px;
     min-height: 600px;
@@ -337,21 +295,30 @@ export component AppWindow inherits Window {
     callback terminal-resize(string /* tab-id */, float /* width-px */, float /* height-px */);
 
     // --- SFTP callbacks ---------------------------------------------------
-    // Navigate to a new remote directory (or ".." to go up).
-    callback sftp-navigate(string /* tab-id */, string /* path */);
-    // Trigger a download: Rust opens a save-folder dialog then transfers.
-    callback sftp-download(string /* tab-id */, string /* remote-path */);
-    // Trigger an upload: Rust opens a file-picker dialog then transfers.
-    callback sftp-upload-clicked(string /* tab-id */, string /* remote-dir */, bool /* folder */);
-    // Refresh the current directory listing.
-    callback sftp-refresh(string /* tab-id */, string /* path */);
-    // Toggle expand/collapse of a tree node (also navigates to that directory).
-    callback sftp-tree-expand(string /* tab-id */, string /* path */);
-    callback sftp-delete(string /* tab-id */, string /* path */);
-    callback sftp-view(string /* tab-id */, string /* path */);
-    callback sftp-edit(string /* tab-id */, string /* path */);
-    callback sftp-open-external(string /* tab-id */, string /* path */);
-    callback sftp-edit-external(string /* tab-id */, string /* path */);
+    // Local panel callbacks
+    callback sftp-local-navigate(string /* tab-id */, string /* path */);
+    callback sftp-local-upload(string /* tab-id */, string /* local-path */, bool /* is-dir */);
+    callback sftp-local-refresh(string /* tab-id */, string /* path */);
+    callback sftp-local-copy-path(string);
+    callback sftp-local-new-folder(string /* dir */);
+    callback sftp-local-new-file(string /* dir */);
+
+    // Remote panel callbacks
+    callback sftp-remote-navigate(string /* tab-id */, string /* path */);
+    callback sftp-remote-download(string /* tab-id */, string /* remote-path */);
+    callback sftp-remote-refresh(string /* tab-id */, string /* path */);
+    callback sftp-remote-delete(string /* tab-id */, string /* path */);
+    callback sftp-remote-view(string /* tab-id */, string /* path */);
+    callback sftp-remote-edit(string /* tab-id */, string /* path */);
+    callback sftp-remote-open-external(string /* tab-id */, string /* path */);
+    callback sftp-remote-edit-external(string /* tab-id */, string /* path */);
+    callback sftp-remote-rename-request(string /* tab-id */, string /* path */, string /* name */);
+    callback sftp-remote-chmod-request(string /* tab-id */, string /* path */, string /* name */, int /* mode */);
+    callback sftp-remote-copy-path(string);
+    callback sftp-remote-new-folder(string /* tab-id */, string /* dir */);
+    callback sftp-remote-new-file(string /* tab-id */, string /* dir */);
+    callback sftp-remote-sync-path(string /* tab-id */);
+
     // SFTP context-menu extensions (#69): rename / chmod / mkdir / touch share
     // one single-input prompt dialog; copy-path goes straight to the clipboard.
     in-out property <bool> sftp-prompt-open: false;
@@ -489,6 +456,7 @@ export component AppWindow inherits Window {
                     }
                     delete-group(name) => { root.delete-group(name); }
                     remove-session(id) => { root.remove-session(id); }
+                    Rectangle { }
                 }
 
                 // Terminal tabs — one TerminalView per terminal state. Only
@@ -511,11 +479,6 @@ export component AppWindow inherits Window {
                     sftp-panel-height <=> root.sftp-panel-height;
                     sftp-collapsed <=> root.sftp-collapsed;
                     sftp-saved-height <=> root.sftp-saved-height;
-                    sftp-path: term.sftp-path;
-                    sftp-entries: term.sftp-entries;
-                    sftp-status: term.sftp-status;
-                    sftp-loading: term.sftp-loading;
-                    sftp-tree-nodes: term.sftp-tree-nodes;
                     quick-commands: root.quick-commands;
                     command-history: root.command-history;
                     run-command(cmd, all) => { root.run-command(term.id, cmd, all); }
@@ -526,44 +489,66 @@ export component AppWindow inherits Window {
                         root.qcm-command = "";
                         root.quick-cmd-manage-open = true;
                     }
+
+                    // Local panel
+                    sftp-local-path: term.sftp-local-path;
+                    sftp-local-entries: term.sftp-local-entries;
+                    sftp-local-status: term.sftp-local-status;
+                    sftp-local-loading: term.sftp-local-loading;
+
+                    // Remote panel
+                    sftp-remote-path: term.sftp-remote-path;
+                    sftp-remote-entries: term.sftp-remote-entries;
+                    sftp-remote-status: term.sftp-remote-status;
+                    sftp-remote-loading: term.sftp-remote-loading;
+
                     send-key(key, ctrl, alt, shift) => { root.send-key(term.id, key, ctrl, alt, shift) }
                     terminal-resize(w, h) => { root.terminal-resize(term.id, w, h) }
-                    sftp-navigate(path) => { root.sftp-navigate(term.id, path); }
-                    sftp-download(path) => { root.sftp-download(term.id, path); }
-                    sftp-upload-clicked(dir, folder) => { root.sftp-upload-clicked(term.id, dir, folder); }
-                    sftp-refresh(path) => { root.sftp-refresh(term.id, path); }
-                    sftp-tree-expand(path) => { root.sftp-tree-expand(term.id, path); }
+
+                    // Local panel callbacks
+                    sftp-local-navigate(tab-id, path) => { root.sftp-local-navigate(tab-id, path); }
+                    sftp-local-upload(tab-id, path, is-dir) => { root.sftp-local-upload(tab-id, path, is-dir); }
+                    sftp-local-refresh(tab-id, path) => { root.sftp-local-refresh(tab-id, path); }
+                    sftp-local-copy-path(path) => { root.sftp-local-copy-path(path); }
+                    sftp-local-new-folder(dir) => { root.sftp-local-new-folder(dir); }
+                    sftp-local-new-file(dir) => { root.sftp-local-new-file(dir); }
+
+                    // Remote panel callbacks
+                    sftp-remote-navigate(tab-id, path) => { root.sftp-remote-navigate(tab-id, path); }
+                    sftp-remote-download(tab-id, path) => { root.sftp-remote-download(tab-id, path); }
+                    sftp-remote-refresh(tab-id, path) => { root.sftp-remote-refresh(tab-id, path); }
+                    sftp-sync-path() => { root.sftp-remote-sync-path(term.id); }
                     // Gate delete behind an in-app confirmation (#28): stash the
                     // target and open the modal; the real delete fires on confirm.
-                    sftp-delete(path) => {
+                    sftp-remote-delete(path) => {
                         root.confirm-delete-tab = term.id;
                         root.confirm-delete-path = path;
                         root.confirm-delete-open = true;
                     }
-                    sftp-view(path) => { root.sftp-view(term.id, path); }
-                    sftp-edit(path) => { root.sftp-edit(term.id, path); }
-                    sftp-open-external(path) => { root.sftp-open-external(term.id, path); }
-                    sftp-edit-external(path) => { root.sftp-edit-external(term.id, path); }
+                    sftp-remote-view(path) => { root.sftp-remote-view(term.id, path); }
+                    sftp-remote-edit(path) => { root.sftp-remote-edit(term.id, path); }
+                    sftp-remote-open-external(path) => { root.sftp-remote-open-external(term.id, path); }
+                    sftp-remote-edit-external(path) => { root.sftp-remote-edit-external(term.id, path); }
                     // #69 context-menu extensions → shared prompt dialog.
-                    sftp-rename-request(path, name) => {
+                    sftp-remote-rename-request(path, name) => {
                         root.sftp-prompt-kind = "rename";
                         root.sftp-prompt-tab = term.id;
                         root.sftp-prompt-target = path;
                         root.sftp-prompt-value = name;
                         root.sftp-prompt-open = true;
                     }
-                    sftp-chmod-request(path, name, mode) => {
+                    sftp-remote-chmod-request(path, name, mode) => {
                         root.sftp-chmod-open(term.id, path, name, mode);
                     }
-                    sftp-copy-path(path) => { root.sftp-copy-path(path); }
-                    sftp-new-folder(dir) => {
+                    sftp-remote-copy-path(path) => { root.sftp-copy-path(path); }
+                    sftp-remote-new-folder(dir) => {
                         root.sftp-prompt-kind = "mkdir";
                         root.sftp-prompt-tab = term.id;
                         root.sftp-prompt-target = dir;
                         root.sftp-prompt-value = "";
                         root.sftp-prompt-open = true;
                     }
-                    sftp-new-file(dir) => {
+                    sftp-remote-new-file(dir) => {
                         root.sftp-prompt-kind = "touch";
                         root.sftp-prompt-tab = term.id;
                         root.sftp-prompt-target = dir;
@@ -587,34 +572,40 @@ export component AppWindow inherits Window {
     // --- Top-right buttons: [☀/🌙 theme] [↓ download] [⚙ settings] ----------
     // Top-right icon row (right→left): settings, download, theme, session sync.
     // Settings (gear) — far right.
-    IconBtn {
+    IconButton {
+        size: 26px;
         x: root.width - 34px; y: 8px;
-        icon: "\u{E8B8}";
+        glyph: "\u{E8B8}";
         tooltip: root.lang-en ? "Settings" : "设置";
         active: root.settings-open;
         clicked => { root.settings-open = !root.settings-open; root.download-open = false; }
     }
     // Download manager — left of settings.
-    IconBtn {
+    IconButton {
+        size: 26px;
         x: root.width - 64px; y: 8px;
-        icon: "\u{E2C4}";              // Material Icons file_download
+        glyph: "\u{E2C4}";              // Material Icons file_download
         tooltip: root.lang-en ? "Download" : "下载";
         active: root.download-open;
         clicked => { root.download-open = !root.download-open; root.settings-open = false; }
     }
     // Theme toggle (sun when dark → click for light; moon when light → for dark).
-    IconBtn {
+    IconButton {
+        size: 26px;
         x: root.width - 94px; y: 8px;
-        icon: Theme.dark ? "\u{E518}" : "\u{E51C}";
+        glyph: Theme.dark ? "\u{E518}" : "\u{E51C}";
         icon-color: Theme.dark ? #f5c542 : #5856d6;  // amber sun / indigo moon
+        icon-color-hover: Theme.dark ? #f5c542 : #5856d6;
         tooltip: root.lang-en ? "Toggle theme" : "切换主题";
         clicked => { root.toggle-theme(); }
     }
     // Session sync / broadcast input — left of theme (#78 pt.4).
-    IconBtn {
+    IconButton {
+        size: 26px;
         x: root.width - 124px; y: 8px;
-        icon: "\u{E627}";             // Material Icons "sync"
+        glyph: "\u{E627}";             // Material Icons "sync"
         icon-color: root.sync-input ? Theme.accent : Theme.text-secondary;
+        icon-color-hover: root.sync-input ? Theme.accent : Theme.text-secondary;
         active: root.sync-input;
         tooltip: root.lang-en
             ? (root.sync-input ? "Sync input: ON" : "Sync input")
@@ -1221,7 +1212,7 @@ export component AppWindow inherits Window {
                     Text { text: "\u{E429}"; font-family: "Material Icons"; // tune
                            color: Theme.text-secondary; font-size: Theme.fs-sm;
                            vertical-alignment: center; }
-                    Text { text: root.lang-en ? "Interface" : "界面";
+                    Text { text: @tr("Optins");
                            color: Theme.text-primary; font-size: Theme.fs-md;
                            vertical-alignment: center; horizontal-stretch: 1; }
                 }
@@ -1637,7 +1628,7 @@ export component AppWindow inherits Window {
                 padding: 18px;
                 spacing: 12px;
                 Text {
-                    text: root.lang-en ? "Close meatshell?" : "确定关闭 meatshell?";
+                    text: root.lang-en ? "Close ashell?" : "确定关闭 ashell?";
                     color: Theme.text-primary; font-size: Theme.fs-lg; font-weight: 700;
                 }
                 Text {
@@ -1992,7 +1983,7 @@ export component AppWindow inherits Window {
                                 border-color: Theme.border-subtle;
                                 Text {
                                     x: 10px;
-                                    text: "meatshell ~$ echo preview 0123";
+                                    text: "ashell ~$ echo preview 0123";
                                     font-family: Theme.term-font-family;
                                     font-size: Theme.term-font-size;
                                     color: Theme.term-fg;
@@ -2145,7 +2136,7 @@ export component AppWindow inherits Window {
 
                 HorizontalLayout {
                     Text {
-                        text: @tr("About meatshell");
+                        text: @tr("About ashell");
                         color: Theme.text-primary;
                         font-size: Theme.fs-lg;
                         font-weight: 700;
@@ -2248,9 +2239,31 @@ export component AppWindow inherits Window {
         detail: root.confirm-delete-path;
         confirm-label: @tr("Delete");
         confirm => {
-            root.sftp-delete(root.confirm-delete-tab, root.confirm-delete-path);
+            root.sftp-remote-delete(root.confirm-delete-tab, root.confirm-delete-path);
             root.confirm-delete-open = false;
         }
         cancel => { root.confirm-delete-open = false; }
+    }
+
+    if Theme.tooltip-show && Theme.tooltip-enabled && Theme.tooltip-text != "" : Rectangle {
+        x: Theme.tooltip-x - self.width;   // align right edge with the icon
+        y: Theme.tooltip-y;
+        width: tip-txt.preferred-width + 16px;
+        height: 22px;
+        background: Theme.bg-elevated;
+        border-radius: Theme.radius-sm;
+        border-width: 1px;
+        border-color: Theme.border-strong;
+        drop-shadow-blur: 8px;
+        drop-shadow-color: #00000070;
+        tip-txt := Text {
+            text: Theme.tooltip-text;
+            color: Theme.text-primary;
+            font-size: Theme.fs-xs;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            width: parent.width;
+            height: parent.height;
+        }
     }
 }

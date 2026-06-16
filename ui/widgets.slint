@@ -6,28 +6,70 @@ import { Theme } from "theme.slint";
 export component IconButton inherits Rectangle {
     in property <string> glyph;
     in property <string> tooltip;
-    in property <length> size: 28px;
-    in property <brush> fg: Theme.text-secondary;
-    in property <brush> fg-hover: Theme.text-primary;
+    in property <bool> active: false;
+    in property <length> size: Theme.icon-size;
+    in property <brush> icon-color: Theme.text-secondary;
+    in property <brush> icon-color-hover: Theme.text-primary;
+    in property <string> font-family: Theme.icon-font-family;
     callback clicked();
+
+    // Expose hover state for external detection
+    property <bool> hovering: touch.has-hover;
+
+    in property <length> move-x: Theme.icon-size;
+    in property <length> move-y: Theme.icon-size + 4px;
 
     width: size;
     height: size;
     border-radius: Theme.radius-sm;
-    background: touch.has-hover ? Theme.bg-hover : transparent;
+    background: touch.has-hover || active ? Theme.bg-hover : transparent;
     animate background { duration: 120ms; }
 
     Text {
         text: glyph;
-        color: touch.has-hover ? fg-hover : fg;
+        color: touch.has-hover || active ? icon-color-hover : icon-color;
         font-size: Theme.fs-md;
+        font-family: font-family;
         horizontal-alignment: center;
         vertical-alignment: center;
     }
 
     touch := TouchArea {
         mouse-cursor: pointer;
+//        pointer-event(evt) => {
+//            Theme.tooltip-x = self.absolute-position.x + root.move-x;
+//            Theme.tooltip-y = self.absolute-position.y + root.move-y;
+//        }
         clicked => { root.clicked(); }
+    }
+
+    timer := Timer {
+        interval: Theme.tooltip-delay * 1ms;
+        running: false;
+        triggered => {
+            // After delay, show tooltip if still hovering
+            if (root.tooltip != "" && touch.has-hover) {
+                Theme.tooltip-text = root.tooltip;
+                Theme.tooltip-x = touch.absolute-position.x + root.move-x;
+                Theme.tooltip-y = touch.absolute-position.y + root.move-y;
+                Theme.tooltip-show = true;
+//                Theme.glolal-tooltip-show(root.move-x, root.move-y, root.tooltip);
+            } else {
+                timer.running = false;
+            }
+        }
+    }
+
+    // Hide tooltip immediately when mouse leaves, start timer when entering
+    changed hovering => {
+        if (hovering && Theme.tooltip-enabled) {
+            // Mouse entered: start countdown timer
+            timer.running = true;
+        } else {
+            // Mouse left: stop timer and hide tooltip immediately
+            timer.running = false;
+            Theme.tooltip-show = false;
+        }
     }
 }
 

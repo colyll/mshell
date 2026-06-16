@@ -329,6 +329,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "ashell"
+version = "0.4.6"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "async-trait",
+ "base64",
+ "chacha20poly1305",
+ "chrono",
+ "dark-light",
+ "directories",
+ "fontdb 0.16.2",
+ "futures",
+ "i-slint-backend-winit",
+ "image",
+ "once_cell",
+ "rand 0.8.6",
+ "rfd",
+ "russh",
+ "russh-keys",
+ "russh-sftp",
+ "serde",
+ "serde_json",
+ "serialport",
+ "slint",
+ "slint-build",
+ "ssh-key",
+ "sysinfo",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-socks",
+ "tracing",
+ "tracing-subscriber",
+ "ureq",
+ "uuid",
+ "vt100",
+ "winresource",
+ "zeroize",
+]
+
+[[package]]
 name = "ashpd"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3386,46 +3427,6 @@ name = "md5"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
-
-[[package]]
-name = "meatshell"
-version = "0.4.6"
-dependencies = [
- "anyhow",
- "arboard",
- "async-trait",
- "base64",
- "chacha20poly1305",
- "chrono",
- "dark-light",
- "directories",
- "fontdb 0.16.2",
- "futures",
- "i-slint-backend-winit",
- "image",
- "rand 0.8.6",
- "rfd",
- "russh",
- "russh-keys",
- "russh-sftp",
- "serde",
- "serde_json",
- "serialport",
- "slint",
- "slint-build",
- "ssh-key",
- "sysinfo",
- "thiserror 1.0.69",
- "tokio",
- "tokio-socks",
- "tracing",
- "tracing-subscriber",
- "ureq",
- "uuid",
- "vt100",
- "winresource",
- "zeroize",
-]
 
 [[package]]
 name = "memchr"

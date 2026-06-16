@@ -5,20 +5,20 @@
 <dict>
     <!-- The executable inside Contents/MacOS/ -->
     <key>CFBundleExecutable</key>
-    <string>meatshell</string>
+    <string>ashell</string>
 
-    <!-- Points to Contents/Resources/meatshell.icns (no extension) -->
+    <!-- Points to Contents/Resources/ashell.icns (no extension) -->
     <key>CFBundleIconFile</key>
-    <string>meatshell</string>
+    <string>ashell</string>
 
     <key>CFBundleIdentifier</key>
-    <string>dev.meatshell.meatshell</string>
+    <string>dev.ashell.ashell</string>
 
     <key>CFBundleName</key>
-    <string>meatshell</string>
+    <string>ashell</string>
 
     <key>CFBundleDisplayName</key>
-    <string>meatshell</string>
+    <string>ashell</string>
 
     <key>CFBundlePackageType</key>
     <string>APPL</string>

@@ -30,7 +30,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::{AuthMethod, Session};
 use crate::i18n::t;
-use crate::ssh::{format_mtime, format_size, RemoteEntry, RemoteTreeNode, SessionEvent};
+use crate::ssh::{format_mtime, format_size, RemoteEntry, SessionEvent};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -41,8 +41,8 @@ use crate::ssh::{format_mtime, format_size, RemoteEntry, RemoteTreeNode, Session
 pub enum SftpCommand {
     /// List the contents of a remote directory.
     ListDir(String),
-    /// Toggle a directory node in the tree (expand if collapsed, collapse if expanded).
-    ToggleTreeNode(String),
+    /// Sync the terminal's current working directory to SFTP panel.
+    SyncCwd(String),
     /// Download a remote file to a local directory.
     Download { remote: String, local_dir: String },
     /// Upload a local file into a remote directory.
@@ -80,6 +80,9 @@ impl SftpHandle {
     pub fn list_dir(&self, path: String) {
         let _ = self.commands.send(SftpCommand::ListDir(path));
     }
+    pub fn sync_cwd(&self, cwd: String) {
+        let _ = self.commands.send(SftpCommand::SyncCwd(cwd));
+    }
     pub fn download(&self, remote: String, local_dir: String) {
         let _ = self
             .commands
@@ -89,9 +92,6 @@ impl SftpHandle {
         let _ = self
             .commands
             .send(SftpCommand::Upload { local, remote_dir });
-    }
-    pub fn toggle_tree_node(&self, path: String) {
-        let _ = self.commands.send(SftpCommand::ToggleTreeNode(path));
     }
     pub fn delete(&self, path: String) {
         let _ = self.commands.send(SftpCommand::Delete(path));
@@ -148,46 +148,6 @@ pub fn spawn_sftp(
     SftpHandle {
         commands: cmd_tx,
         join,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Worker
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Tree state helpers
-// ---------------------------------------------------------------------------
-
-/// Recursively build the flat node list from tree state (DFS pre-order).
-fn build_tree_nodes(
-    path: &str,
-    depth: u32,
-    expanded: &std::collections::HashSet<String>,
-    tree_dirs: &std::collections::HashMap<String, Vec<(String, String)>>,
-    nodes: &mut Vec<RemoteTreeNode>,
-) {
-    let name = if path == "/" {
-        "/".to_string()
-    } else {
-        path.rsplit('/').next().unwrap_or(path).to_string()
-    };
-    let children = tree_dirs.get(path);
-    let has_children = children.map(|c| !c.is_empty()).unwrap_or(true);
-    let is_expanded = expanded.contains(path);
-    nodes.push(RemoteTreeNode {
-        path: path.to_string(),
-        name,
-        depth,
-        expanded: is_expanded,
-        has_children,
-    });
-    if is_expanded {
-        if let Some(ch) = children {
-            for (_, child_path) in ch {
-                build_tree_nodes(child_path, depth + 1, expanded, tree_dirs, nodes);
-            }
-        }
     }
 }
 
@@ -293,50 +253,32 @@ async fn run_sftp(
         }
     }
 
-    // --- Directory tree initialization -------------------------------------
-    // tree_dirs: path -> [(child_name, child_full_path)] for directories only
-    // tree_expanded: set of paths currently shown as expanded
-    let mut tree_dirs: std::collections::HashMap<String, Vec<(String, String)>> =
-        std::collections::HashMap::new();
-    let mut tree_expanded: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    // Fetch root "/" subdirs, then expand path down to home.
-    let root_dirs = list_dirs_only_impl(&sftp, "/").await.unwrap_or_default();
-    tree_dirs.insert("/".to_string(), root_dirs);
-    tree_expanded.insert("/".to_string());
-
-    // Walk each path segment from "/" toward home, expanding as we go.
-    if home != "/" {
-        let mut current = "/".to_string();
-        for segment in home.trim_start_matches('/').split('/') {
-            if segment.is_empty() {
-                continue;
-            }
-            let child = format!("{}/{}", current.trim_end_matches('/'), segment);
-            // Only expand if this child appeared in the parent listing.
-            let found = tree_dirs
-                .get(&current)
-                .map(|c| c.iter().any(|(_, p)| p == &child))
-                .unwrap_or(false);
-            if !found {
-                break;
-            }
-            let dirs = list_dirs_only_impl(&sftp, &child).await.unwrap_or_default();
-            tree_dirs.insert(child.clone(), dirs);
-            tree_expanded.insert(child.clone());
-            current = child;
-        }
-    }
-    {
-        let mut nodes = Vec::new();
-        build_tree_nodes("/", 0, &tree_expanded, &tree_dirs, &mut nodes);
-        let _ = events.send(SessionEvent::SftpTreeUpdate(nodes));
-    }
-
     // --- Command loop -------------------------------------------------------
     while let Some(cmd) = commands.recv().await {
         match cmd {
             SftpCommand::Close => break,
+
+            SftpCommand::SyncCwd(cwd) => {
+                // Sync terminal cwd to SFTP panel
+                let _ = events.send(SessionEvent::SftpStatus(format!("{} {}...", t("加载", "Loading"), cwd)));
+                match list_dir_impl(&sftp, &cwd).await {
+                    Ok(entries) => {
+                        let _ = events.send(SessionEvent::SftpEntries {
+                            path: cwd.clone(),
+                            entries,
+                        });
+                        let _ = events.send(SessionEvent::SftpStatus(cwd));
+                    }
+                    Err(e) => {
+                        // Clear the list and show the invalid path so user sees the error
+                        let _ = events.send(SessionEvent::SftpEntries {
+                            path: cwd.clone(),
+                            entries: vec![],
+                        });
+                        let _ = events.send(SessionEvent::SftpStatus(format!("{}: {e}", t("列目录失败", "list directory failed"))));
+                    }
+                }
+            }
 
             SftpCommand::ListDir(path) => {
                 let _ = events.send(SessionEvent::SftpStatus(format!("{} {}...", t("加载", "Loading"), path)));
@@ -349,27 +291,14 @@ async fn run_sftp(
                         let _ = events.send(SessionEvent::SftpStatus(path));
                     }
                     Err(e) => {
+                        // Clear the list and show the invalid path so user sees the error
+                        let _ = events.send(SessionEvent::SftpEntries {
+                            path: path.clone(),
+                            entries: vec![],
+                        });
                         let _ = events.send(SessionEvent::SftpStatus(format!("{}: {e}", t("列目录失败", "list directory failed"))));
                     }
                 }
-            }
-
-            SftpCommand::ToggleTreeNode(path) => {
-                if tree_expanded.contains(&path) {
-                    // Collapse this node and all descendants.
-                    let prefix = format!("{}/", path.trim_end_matches('/'));
-                    tree_expanded.retain(|p| p != &path && !p.starts_with(&prefix));
-                } else {
-                    // Expand: fetch children if not yet cached.
-                    if !tree_dirs.contains_key(&path) {
-                        let dirs = list_dirs_only_impl(&sftp, &path).await.unwrap_or_default();
-                        tree_dirs.insert(path.clone(), dirs);
-                    }
-                    tree_expanded.insert(path.clone());
-                }
-                let mut nodes = Vec::new();
-                build_tree_nodes("/", 0, &tree_expanded, &tree_dirs, &mut nodes);
-                let _ = events.send(SessionEvent::SftpTreeUpdate(nodes));
             }
 
             SftpCommand::Download { remote, local_dir } => {
@@ -618,7 +547,7 @@ async fn run_sftp(
                 // Sanitize the remote-controlled name before it becomes a local
                 // file path that we later hand to the OS "open" call.
                 let filename = sanitize_filename(&base_name(&remote));
-                let tmp_dir = std::env::temp_dir().join("meatshell");
+                let tmp_dir = std::env::temp_dir().join("ashell");
                 let _ = tokio::fs::create_dir_all(&tmp_dir).await;
                 let local = tmp_dir.join(&filename);
                 let local_str = local.to_string_lossy().to_string();
@@ -943,16 +872,6 @@ async fn list_dir_impl(sftp: &SftpSession, path: &str) -> Result<Vec<RemoteEntry
     Ok(entries)
 }
 
-/// List only the subdirectories of `path` (no files). Used to build the tree.
-async fn list_dirs_only_impl(sftp: &SftpSession, path: &str) -> Result<Vec<(String, String)>> {
-    let entries = list_dir_impl(sftp, path).await?;
-    Ok(entries
-        .into_iter()
-        .filter(|e| e.is_dir)
-        .map(|e| (e.name, e.full_path))
-        .collect())
-}
-
 /// Emit a transfer-progress event.
 fn emit_transfer(
     events: &UnboundedSender<SessionEvent>,
@@ -1267,11 +1186,10 @@ impl Handler for SftpClientHandler {
     }
 }
 
-// Keep format helpers and RemoteTreeNode imports live.
+// Keep format helpers live.
 const _: fn() = || {
     let _ = format_size(0);
     let _ = format_mtime(0);
-    let _: RemoteTreeNode;
 };
 
 #[cfg(test)]
